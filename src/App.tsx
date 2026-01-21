@@ -28,6 +28,7 @@ import {
  * You can override via Vite env:
  * - VITE_FEE_RECEIVER=<PUBKEY>
  * - VITE_FEE_SOL=0.003
+ * - VITE_SOLANA_CLUSTER=devnet|mainnet-beta|testnet
  */
 const DEFAULT_FEE_RECEIVER = "b9gmEiA4D16bHqcW1SinTDEhBnYF8d4fn7GxEzcrvEc";
 const DEFAULT_FEE_SOL = "0.003";
@@ -381,6 +382,37 @@ function safeParseProof(raw: string | null): BurnProof | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Robust signature state:
+ * - "missing": no status record
+ * - "ok": landed and succeeded
+ * - "err": landed but failed (v.err != null)
+ */
+async function getSignatureState(
+  connection: Connection,
+  sig: string
+): Promise<"missing" | "ok" | "err"> {
+  try {
+    const st = await connection.getSignatureStatuses([sig], { searchTransactionHistory: true });
+    const v = st?.value?.[0];
+    if (!v) return "missing";
+    return v.err ? "err" : "ok";
+  } catch {
+    return "missing";
+  }
+}
+
+/**
+ * Proof must only be generated for successful transactions.
+ * Throws if not successful.
+ */
+async function assertSignatureSuccess(connection: Connection, sig: string): Promise<void> {
+  const state = await getSignatureState(connection, sig);
+  if (state === "ok") return;
+  if (state === "err") throw new Error("Transaction failed on-chain (status.err != null).");
+  throw new Error("Transaction status not found (not landed).");
 }
 
 export default function App() {
@@ -770,12 +802,14 @@ export default function App() {
     const tokenAccountPk = new PublicKey(selectedRow.tokenAccount);
 
     try {
+      const conn = connection as Connection;
+
       const { programId: tokenProgramId, decimals: mintDecimals } = await resolveMintProgramAndDecimals(mintPk);
 
-      const mintBefore = await getMint(connection as Connection, mintPk, commitment, tokenProgramId);
+      const mintBefore = await getMint(conn, mintPk, commitment, tokenProgramId);
       const supplyBefore = mintBefore.supply;
 
-      const accBefore = await getAccount(connection as Connection, tokenAccountPk, commitment, tokenProgramId);
+      const accBefore = await getAccount(conn, tokenAccountPk, commitment, tokenProgramId);
 
       if (!accBefore.owner.equals(publicKey)) {
         throw new Error(
@@ -803,7 +837,7 @@ export default function App() {
       const pctMicro = calcPctOfSupplyMicro(amountRaw, supplyBefore);
 
       const buildTx = async (): Promise<{ tx: Transaction; latest: BlockhashWithExpiryBlockHeight }> => {
-        const latest: BlockhashWithExpiryBlockHeight = await (connection as Connection).getLatestBlockhash(commitment);
+        const latest: BlockhashWithExpiryBlockHeight = await conn.getLatestBlockhash(commitment);
 
         const ixFee = SystemProgram.transfer({
           fromPubkey: publicKey,
@@ -819,7 +853,7 @@ export default function App() {
 
         // Optional: explicit simulation in dev to avoid wallet prompts when doomed
         if (!isProd) {
-          const sim = await (connection as Connection).simulateTransaction(tx);
+          const sim = await conn.simulateTransaction(tx);
           if (sim.value.err) {
             const logs = sim.value.logs?.join("\n") ?? "";
             throw new Error(`Simulation failed.\n${logs}`);
@@ -831,7 +865,7 @@ export default function App() {
 
       const sendOnce = async (): Promise<{ sig: string; latest: BlockhashWithExpiryBlockHeight }> => {
         const { tx, latest } = await buildTx();
-        const sig = await sendTransaction(tx, connection as Connection, {
+        const sig = await sendTransaction(tx, conn, {
           skipPreflight: false,
           preflightCommitment: commitment,
           maxRetries: 3,
@@ -840,44 +874,40 @@ export default function App() {
       };
 
       const confirmOnce = async (sig: string, latest: BlockhashWithExpiryBlockHeight) => {
-        await (connection as Connection).confirmTransaction(
+        await conn.confirmTransaction(
           { signature: sig, blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight },
           commitment
         );
       };
 
-      const hasSignatureLanded = async (sig: string): Promise<boolean> => {
+      const confirmWithSafeRetry = async (
+        firstSig: string,
+        firstLatest: BlockhashWithExpiryBlockHeight
+      ): Promise<string> => {
         try {
-          const st = await (connection as Connection).getSignatureStatuses([sig], { searchTransactionHistory: true });
-          const v = st?.value?.[0];
-          return !!v; // if there is a status record, it has landed (success or failure)
-        } catch {
-          return false;
+          await confirmOnce(firstSig, firstLatest);
+          await assertSignatureSuccess(conn, firstSig);
+          return firstSig;
+        } catch (e: any) {
+          // Only retry on expiry-like confirm errors; still verify on-chain status before deciding.
+          if (!isBlockhashExpiry(e)) throw e;
+
+          const state = await getSignatureState(conn, firstSig);
+          if (state === "ok") return firstSig;
+
+          // If it landed with err, or it never landed, resend (safe: original did not succeed).
+          const retry = await sendOnce();
+          setStep("confirm");
+          await confirmOnce(retry.sig, retry.latest);
+          await assertSignatureSuccess(conn, retry.sig);
+          return retry.sig;
         }
       };
 
       const first = await sendOnce();
       setStep("confirm");
 
-      let finalSig = first.sig;
-
-      try {
-        await confirmOnce(first.sig, first.latest);
-      } catch (e: any) {
-        if (isBlockhashExpiry(e)) {
-          // Prevent double-charging: check whether the original signature already landed before re-sending.
-          const landed = await hasSignatureLanded(first.sig);
-          if (landed) {
-            finalSig = first.sig;
-          } else {
-            const retry = await sendOnce();
-            finalSig = retry.sig;
-            await confirmOnce(retry.sig, retry.latest);
-          }
-        } else {
-          throw e;
-        }
-      }
+      const finalSig = await confirmWithSafeRetry(first.sig, first.latest);
 
       const url = explorerTxUrl(finalSig, clusterClass);
 
@@ -1412,7 +1442,7 @@ export default function App() {
               ) : null}
 
               <div style={{ marginTop: 8, fontSize: 12, opacity: 0.55 }}>
-                If you see "block height exceeded", the RPC was slow. This app can retry once when safe.
+                If you see "block height exceeded", the RPC was slow. This app can safely retry once.
               </div>
             </div>
           </div>
