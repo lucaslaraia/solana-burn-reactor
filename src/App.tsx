@@ -390,10 +390,7 @@ function safeParseProof(raw: string | null): BurnProof | null {
  * - "ok": landed and succeeded
  * - "err": landed but failed (v.err != null)
  */
-async function getSignatureState(
-  connection: Connection,
-  sig: string
-): Promise<"missing" | "ok" | "err"> {
+async function getSignatureState(connection: Connection, sig: string): Promise<"missing" | "ok" | "err"> {
   try {
     const st = await connection.getSignatureStatuses([sig], { searchTransactionHistory: true });
     const v = st?.value?.[0];
@@ -514,7 +511,7 @@ export default function App() {
       `🔥 Burned ${amt} (${pct} of supply)\n` +
       `Mint: ${p.mintShort}\n` +
       `Tx: ${p.explorerUrl}\n` +
-      `via Solana Burn Reactor · ${clusterTag}`
+      `via ChainForge · Burn Module · ${clusterTag}`
     );
   }
 
@@ -975,12 +972,12 @@ export default function App() {
     >
       <div style={{ width: "100%", maxWidth: 920, margin: "0 auto" }}>
         <div style={{ textAlign: "center", marginBottom: 18 }}>
-          <h1 style={{ fontSize: 42, margin: 0 }}>Solana Burn Reactor</h1>
+          <h1 style={{ fontSize: 42, margin: 0 }}>ChainForge · Burn Module</h1>
 
           <p style={{ fontSize: 14, opacity: 0.9, marginTop: 10, lineHeight: 1.35 }}>
-            <strong>Strategic token burning for creators and liquidity managers.</strong>
+            <strong>Burn tokens and reduce circulating supply.</strong>
             <br />
-            Reduce supply, reshape distribution, and signal on-chain scarcity — safely, in one transaction.
+            SPL Token + Token-2022. One transaction (fee + burn), with on-chain verification.
           </p>
 
           <div style={{ display: "flex", justifyContent: "center", marginTop: 14 }}>
